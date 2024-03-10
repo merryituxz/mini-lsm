@@ -1,12 +1,13 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -21,9 +22,9 @@ use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -158,7 +159,19 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        let mut flush_thread = self.flush_thread.lock();
+        if let Some(flush_thread) = flush_thread.take() {
+            flush_thread.join().map_err(|e| anyhow!("{:?}", e))?;
+        }
+
+        while {
+            let guard = self.inner.state.read();
+            !guard.imm_memtables.is_empty()
+        } {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -241,6 +254,8 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        fs::create_dir_all(path)?;
+
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -315,6 +330,11 @@ impl LsmStorageInner {
                 .sstables
                 .get(sst_id)
                 .expect("target sst not found in l0");
+
+            if !sst.may_contain_key(key) {
+                continue;
+            }
+
             let sst_iter = SsTableIterator::create_and_seek_to_key(
                 Arc::clone(sst),
                 KeySlice::from_slice(key),
@@ -400,7 +420,37 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let snapshot = {
+            let guard = self.state.read();
+            guard.as_ref().clone()
+        };
+
+        if snapshot.imm_memtables.is_empty() {
+            return Ok(());
+        }
+
+        let oldest_memtable = snapshot.imm_memtables.last().unwrap();
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        oldest_memtable.flush(&mut sst_builder)?;
+
+        let sst_id = self.next_sst_id();
+        let sst_path = self.path_of_sst(sst_id);
+        let sst = sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            snapshot.l0_sstables.insert(0, oldest_memtable.id());
+            snapshot
+                .sstables
+                .insert(oldest_memtable.id(), Arc::new(sst));
+            snapshot.imm_memtables.pop();
+
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -437,6 +487,11 @@ impl LsmStorageInner {
                 .sstables
                 .get(sst_id)
                 .expect("cannot find target sst in l0");
+
+            if !sst.range_overlap(map_bound(lower), map_bound(upper)) {
+                continue;
+            }
+
             let sst_iter = match lower {
                 Bound::Included(key) => SsTableIterator::create_and_seek_to_key(
                     Arc::clone(sst),
