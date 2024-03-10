@@ -2,6 +2,7 @@ pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
+use std::collections::Bound;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -277,5 +278,41 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn range_overlap(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> bool {
+        match lower {
+            Bound::Included(bound) => {
+                if self.last_key.raw_ref() < bound.as_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(bound) => {
+                if self.last_key.raw_ref() <= bound.as_ref() {
+                    return false;
+                }
+            }
+            Bound::Unbounded => {}
+        }
+
+        match upper {
+            Bound::Included(bound) => {
+                if self.first_key.raw_ref() > bound.as_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(bound) => {
+                if self.first_key.raw_ref() >= bound.as_ref() {
+                    return false;
+                }
+            }
+            Bound::Unbounded => {}
+        }
+
+        true
+    }
+
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.first_key.raw_ref() <= key && key <= self.last_key.raw_ref()
     }
 }
