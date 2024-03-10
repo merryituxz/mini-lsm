@@ -1,7 +1,5 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
 use anyhow::Result;
@@ -47,7 +45,32 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        if iters.is_empty() {
+            return Self {
+                iters: BinaryHeap::default(),
+                current: None,
+            };
+        }
+
+        if iters.iter().all(|iter| !iter.is_valid()) {
+            return Self {
+                iters: BinaryHeap::default(),
+                current: None,
+            };
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+
+        let current = heap.pop().unwrap();
+        Self {
+            iters: heap,
+            current: Some(current),
+        }
     }
 }
 
@@ -56,19 +79,67 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn value(&self) -> &[u8] {
+        if let Some(current) = &self.current {
+            return current.1.value();
+        }
+
+        &[]
     }
 
-    fn value(&self) -> &[u8] {
-        unimplemented!()
+    fn key(&self) -> KeySlice {
+        if let Some(current) = &self.current {
+            return current.1.key();
+        }
+
+        KeySlice::default()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if let Some(current) = &self.current {
+            return current.1.is_valid();
+        }
+
+        false
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let current = self.current.as_mut().unwrap();
+
+        // iterate while current key == peek's key
+        while let Some(mut inner_iter) = self.iters.peek_mut() {
+            if inner_iter.1.key() == current.1.key() {
+                if let e @ Err(_) = inner_iter.1.next() {
+                    PeekMut::pop(inner_iter);
+                    return e;
+                }
+
+                if !inner_iter.1.is_valid() {
+                    PeekMut::pop(inner_iter);
+                }
+            } else {
+                break;
+            }
+        }
+
+        current.1.next()?;
+
+        // if current is not valid, reset current
+        if !current.1.is_valid() {
+            if let Some(iter) = self.iters.pop() {
+                *current = iter;
+            }
+
+            return Ok(());
+        }
+
+        // compare with heap top and swap if necessary
+        if let Some(mut inner_iter) = self.iters.peek_mut() {
+            if *current < *inner_iter {
+                std::mem::swap(&mut *inner_iter, current);
+            }
+        }
+
+        Ok(())
     }
 }
