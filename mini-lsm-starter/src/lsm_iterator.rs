@@ -1,24 +1,34 @@
 use anyhow::{bail, Result};
+use bytes::Bytes;
+use std::ops::Bound;
 
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::mem_table::map_bound;
+use crate::table::SsTableIterator;
 use crate::{
     iterators::{merge_iterator::MergeIterator, StorageIterator},
     mem_table::MemTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the tutorial for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    upper: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, upper: Bound<&[u8]>) -> Result<Self> {
         let mut iter = iter;
         while iter.is_valid() && iter.value().is_empty() {
             iter.next()?;
         }
-        Ok(Self { inner: iter })
+        Ok(Self {
+            inner: iter,
+            upper: map_bound(upper),
+        })
     }
 }
 
@@ -34,7 +44,15 @@ impl StorageIterator for LsmIterator {
     }
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        if !self.inner.is_valid() {
+            return false;
+        }
+
+        match &self.upper {
+            Bound::Included(bound) => self.key() <= bound.as_ref(),
+            Bound::Excluded(bound) => self.key() < bound.as_ref(),
+            Bound::Unbounded => true,
+        }
     }
 
     fn next(&mut self) -> Result<()> {
@@ -96,17 +114,18 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.has_errored {
-            match self.iter.next() {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    self.has_errored = true;
-                    Err(err)
-                }
-            }
-        } else {
+        if self.has_errored {
             bail!("inner iterator has error");
         }
+
+        if self.is_valid() {
+            if let Err(err) = self.iter.next() {
+                self.has_errored = true;
+                return Err(err);
+            }
+        }
+
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
