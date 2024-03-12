@@ -119,37 +119,28 @@ impl LsmStorageInner {
             CompactionTask::Tiered(_) => {
                 unimplemented!()
             }
-            CompactionTask::Simple(_) => {
-                unimplemented!()
-            }
+            CompactionTask::Simple(task) => self.compact_two_levels(
+                &task.upper_level_sst_ids,
+                &task.lower_level_sst_ids,
+                task.upper_level.is_none(),
+            ),
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
-            } => self.compact_two_levels(l0_sstables, l1_sstables),
+            } => self.compact_two_levels(l0_sstables, l1_sstables, true),
         }
     }
 
-    // TODO(tomxczhang) bug here
     fn compact_two_levels(
         &self,
         upper_level: &Vec<usize>,
         lower_level: &Vec<usize>,
+        l0_compaction: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let snapshot = {
             let guard = self.state.read();
             guard.as_ref().clone()
         };
-
-        let mut sst_iters = Vec::with_capacity(upper_level.len());
-        for sst_id in upper_level.iter() {
-            let sst = snapshot
-                .sstables
-                .get(sst_id)
-                .expect("no target sst found in upper level");
-            let sst_iter = SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?;
-            sst_iters.push(Box::new(sst_iter));
-        }
-        let upper_merge_iter = MergeIterator::create(sst_iters);
 
         let mut lower_ssts = Vec::with_capacity(lower_level.len());
         for sst_id in lower_level.iter() {
@@ -161,38 +152,95 @@ impl LsmStorageInner {
         }
         let lower_concat_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
 
-        let mut two_merge_iter = TwoMergeIterator::create(upper_merge_iter, lower_concat_iter)?;
+        if l0_compaction {
+            let mut sst_iters = Vec::with_capacity(upper_level.len());
+            for sst_id in upper_level.iter() {
+                let sst = snapshot
+                    .sstables
+                    .get(sst_id)
+                    .expect("no target sst found in upper level");
+                let sst_iter = SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?;
+                sst_iters.push(Box::new(sst_iter));
+            }
+            let upper_merge_iter = MergeIterator::create(sst_iters);
 
-        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
-        let mut compacted_ssts = Vec::new();
-        while two_merge_iter.is_valid() {
-            let (key, value) = (two_merge_iter.key(), two_merge_iter.value());
-            if value.is_empty() {
+            let mut two_merge_iter = TwoMergeIterator::create(upper_merge_iter, lower_concat_iter)?;
+
+            let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+            let mut compacted_ssts = Vec::new();
+            while two_merge_iter.is_valid() {
+                let (key, value) = (two_merge_iter.key(), two_merge_iter.value());
+                if value.is_empty() {
+                    two_merge_iter.next()?;
+                    continue;
+                }
+
+                sst_builder.add(key, value);
+
+                if sst_builder.estimated_size() >= self.options.target_sst_size {
+                    let sst_id = self.next_sst_id();
+                    let sst_path = self.path_of_sst(sst_id);
+                    let sst =
+                        sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+                    compacted_ssts.push(Arc::new(sst));
+                    sst_builder = SsTableBuilder::new(self.options.block_size);
+                }
+
                 two_merge_iter.next()?;
-                continue;
             }
 
-            sst_builder.add(key, value);
+            // lease data should collect to a new sst
+            let sst_id = self.next_sst_id();
+            let sst_path = self.path_of_sst(sst_id);
+            let sst = sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+            compacted_ssts.push(Arc::new(sst));
 
-            if sst_builder.estimated_size() >= self.options.target_sst_size {
-                let sst_id = self.next_sst_id();
-                let sst_path = self.path_of_sst(sst_id);
-                let sst =
-                    sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
-                compacted_ssts.push(Arc::new(sst));
-                sst_builder = SsTableBuilder::new(self.options.block_size);
+            Ok(compacted_ssts)
+        } else {
+            let mut upper_ssts = Vec::with_capacity(lower_level.len());
+            for sst_id in upper_level.iter() {
+                let sst = snapshot
+                    .sstables
+                    .get(sst_id)
+                    .expect("no target sst found in upper level");
+                upper_ssts.push(Arc::clone(sst));
+            }
+            let upper_concat_iter = SstConcatIterator::create_and_seek_to_first(upper_ssts)?;
+
+            let mut two_merge_iter =
+                TwoMergeIterator::create(upper_concat_iter, lower_concat_iter)?;
+
+            let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+            let mut compacted_ssts = Vec::new();
+            while two_merge_iter.is_valid() {
+                let (key, value) = (two_merge_iter.key(), two_merge_iter.value());
+                if value.is_empty() {
+                    two_merge_iter.next()?;
+                    continue;
+                }
+
+                sst_builder.add(key, value);
+
+                if sst_builder.estimated_size() >= self.options.target_sst_size {
+                    let sst_id = self.next_sst_id();
+                    let sst_path = self.path_of_sst(sst_id);
+                    let sst =
+                        sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+                    compacted_ssts.push(Arc::new(sst));
+                    sst_builder = SsTableBuilder::new(self.options.block_size);
+                }
+
+                two_merge_iter.next()?;
             }
 
-            two_merge_iter.next()?;
+            // lease data should collect to a new sst
+            let sst_id = self.next_sst_id();
+            let sst_path = self.path_of_sst(sst_id);
+            let sst = sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+            compacted_ssts.push(Arc::new(sst));
+
+            Ok(compacted_ssts)
         }
-
-        // lease data should collect to a new sst
-        let sst_id = self.next_sst_id();
-        let sst_path = self.path_of_sst(sst_id);
-        let sst = sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
-        compacted_ssts.push(Arc::new(sst));
-
-        Ok(compacted_ssts)
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
@@ -235,7 +283,46 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let snapshot = {
+            let state = self.state.read();
+            state.as_ref().clone()
+        };
+        let compaction_task = self
+            .compaction_controller
+            .generate_compaction_task(&snapshot);
+
+        if compaction_task.is_none() {
+            return Ok(());
+        }
+        let compaction_task = compaction_task.unwrap();
+
+        let compacted_ssts = self.compact(&compaction_task)?;
+        let compacted_sst_ids = compacted_ssts
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect::<Vec<usize>>();
+
+        {
+            let mut guard = self.state.write();
+            let snapshot = guard.as_ref().clone();
+            let (mut snapshot, ssts_need_remove) = self
+                .compaction_controller
+                .apply_compaction_result(&snapshot, &compaction_task, &compacted_sst_ids);
+
+            for old_sst_id in ssts_need_remove.iter() {
+                snapshot.sstables.remove(old_sst_id);
+            }
+
+            for sst in compacted_ssts.iter() {
+                snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
+            }
+
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
