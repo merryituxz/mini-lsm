@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 use crate::lsm_storage::LsmStorageState;
 

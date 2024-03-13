@@ -24,6 +24,7 @@ use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{map_bound, MemTable};
+use crate::mini_lsm_debug;
 use crate::mvcc::LsmMvccInner;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -330,7 +331,7 @@ impl LsmStorageInner {
             let sst = snapshot
                 .sstables
                 .get(sst_id)
-                .expect("target sst not found in l0");
+                .unwrap_or_else(|| panic!("target sst[{}] not found in l0", sst_id));
 
             if !sst.may_contain_key(key) {
                 continue;
@@ -364,7 +365,7 @@ impl LsmStorageInner {
                     snapshot
                         .sstables
                         .get(id)
-                        .unwrap_or_else(|| panic!("target sst not found in l{}", level))
+                        .unwrap_or_else(|| panic!("target sst[{}] not found in l[{}]", id, level))
                 })
                 .map(Arc::clone)
                 .collect();
@@ -473,10 +474,18 @@ impl LsmStorageInner {
         {
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
-            snapshot.l0_sstables.insert(0, oldest_memtable.id());
-            snapshot
-                .sstables
-                .insert(oldest_memtable.id(), Arc::new(sst));
+
+            if self.compaction_controller.flush_to_l0() {
+                snapshot.l0_sstables.insert(0, sst_id);
+            } else {
+                snapshot.levels.insert(0, (sst_id, vec![sst_id]));
+            }
+
+            mini_lsm_debug!(
+                "[force_flush_next_imm_memtable] sstables insert table[{}]",
+                sst_id
+            );
+            snapshot.sstables.insert(sst_id, Arc::new(sst));
             snapshot.imm_memtables.pop();
 
             *guard = Arc::new(snapshot);
@@ -517,7 +526,7 @@ impl LsmStorageInner {
             let sst = snapshot
                 .sstables
                 .get(sst_id)
-                .expect("cannot find target sst in l0");
+                .unwrap_or_else(|| panic!("target sst[{}] not found in l0", sst_id));
 
             if !sst.range_overlap(map_bound(lower), map_bound(upper)) {
                 continue;
@@ -554,12 +563,10 @@ impl LsmStorageInner {
                     snapshot
                         .sstables
                         .get(id)
-                        .unwrap_or_else(|| panic!("target sst not found in l{}", level))
+                        .unwrap_or_else(|| panic!("target sst[{}] not found in l{}", id, level))
                 })
                 .map(Arc::clone)
                 .collect();
-            // let concat_iter =
-            //     SstConcatIterator::create_and_seek_to_key(ssts, KeySlice::from_slice(key))?;
 
             let concat_iter = match lower {
                 Bound::Included(key) => {
