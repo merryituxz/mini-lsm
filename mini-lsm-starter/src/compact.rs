@@ -20,6 +20,7 @@ pub use simple_leveled::{
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::mini_lsm_debug;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,8 +117,63 @@ impl LsmStorageInner {
             CompactionTask::Leveled(_) => {
                 unimplemented!()
             }
-            CompactionTask::Tiered(_) => {
-                unimplemented!()
+            CompactionTask::Tiered(task) => {
+                let snapshot = {
+                    let guard = self.state.read();
+                    guard.as_ref().clone()
+                };
+
+                let mut tier_concat_iters = Vec::with_capacity(task.tiers.len());
+                for (tier_id, tier) in task.tiers.iter() {
+                    let tier_ssts = tier
+                        .iter()
+                        .map(|sst_id| {
+                            snapshot.sstables.get(sst_id).unwrap_or_else(|| {
+                                panic!("target sst[{}] not found in tier[{}]", sst_id, tier_id)
+                            })
+                        })
+                        .map(Arc::clone)
+                        .collect::<Vec<_>>();
+                    let tier_concat_iter = SstConcatIterator::create_and_seek_to_first(tier_ssts)?;
+                    tier_concat_iters.push(Box::new(tier_concat_iter));
+                }
+                let mut tier_merge_iter = MergeIterator::create(tier_concat_iters);
+
+                let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+                let mut compacted_ssts = Vec::new();
+                while tier_merge_iter.is_valid() {
+                    let (key, value) = (tier_merge_iter.key(), tier_merge_iter.value());
+
+                    // skip empty value
+                    if value.is_empty() {
+                        tier_merge_iter.next()?;
+                        continue;
+                    }
+
+                    sst_builder.add(key, value);
+
+                    if sst_builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let sst_path = self.path_of_sst(sst_id);
+                        let sst = sst_builder.build(
+                            sst_id,
+                            Some(Arc::clone(&self.block_cache)),
+                            sst_path,
+                        )?;
+                        compacted_ssts.push(Arc::new(sst));
+                        sst_builder = SsTableBuilder::new(self.options.block_size);
+                    }
+
+                    tier_merge_iter.next()?;
+                }
+
+                let sst_id = self.next_sst_id();
+                let sst_path = self.path_of_sst(sst_id);
+                let sst =
+                    sst_builder.build(sst_id, Some(Arc::clone(&self.block_cache)), sst_path)?;
+                compacted_ssts.push(Arc::new(sst));
+
+                Ok(compacted_ssts)
             }
             CompactionTask::Simple(task) => self.compact_two_levels(
                 &task.upper_level_sst_ids,
@@ -147,7 +203,7 @@ impl LsmStorageInner {
             let sst = snapshot
                 .sstables
                 .get(sst_id)
-                .expect("no target sst found in lower level");
+                .unwrap_or_else(|| panic!("target sst[{}] not found in lower level", sst_id));
             lower_ssts.push(Arc::clone(sst));
         }
         let lower_concat_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
@@ -158,7 +214,7 @@ impl LsmStorageInner {
                 let sst = snapshot
                     .sstables
                     .get(sst_id)
-                    .expect("no target sst found in upper level");
+                    .unwrap_or_else(|| panic!("target sst[{}] not found in upper level", sst_id));
                 let sst_iter = SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?;
                 sst_iters.push(Box::new(sst_iter));
             }
@@ -202,7 +258,7 @@ impl LsmStorageInner {
                 let sst = snapshot
                     .sstables
                     .get(sst_id)
-                    .expect("no target sst found in upper level");
+                    .unwrap_or_else(|| panic!("target sst[{}] not found in lower level", sst_id));
                 upper_ssts.push(Arc::clone(sst));
             }
             let upper_concat_iter = SstConcatIterator::create_and_seek_to_first(upper_ssts)?;
@@ -258,6 +314,7 @@ impl LsmStorageInner {
         let compacted_ssts = self.compact(&compaction_task)?;
         let compacted_sst_ids = compacted_ssts.iter().map(|sst| sst.sst_id()).collect();
 
+        // apply compact
         {
             let mut guard = self.state.write();
             let mut snapshot = guard.as_ref().clone();
@@ -268,11 +325,13 @@ impl LsmStorageInner {
             snapshot.l0_sstables.clear();
 
             for old_sst_id in snapshot.levels[0].1.iter() {
+                mini_lsm_debug!("sstable remove {}", old_sst_id);
                 snapshot.sstables.remove(old_sst_id);
             }
             snapshot.levels[0] = (1, compacted_sst_ids);
 
             for sst in compacted_ssts {
+                mini_lsm_debug!("sstable insert {}", sst.sst_id());
                 snapshot.sstables.insert(sst.sst_id(), sst);
             }
 
@@ -304,6 +363,7 @@ impl LsmStorageInner {
             .map(|sst| sst.sst_id())
             .collect::<Vec<usize>>();
 
+        // apply compact result
         {
             let mut guard = self.state.write();
             let snapshot = guard.as_ref().clone();
@@ -311,11 +371,14 @@ impl LsmStorageInner {
                 .compaction_controller
                 .apply_compaction_result(&snapshot, &compaction_task, &compacted_sst_ids);
 
+            mini_lsm_debug!("compact: {:?}", compacted_sst_ids);
+            mini_lsm_debug!("remove: {:?}", ssts_need_remove);
             for old_sst_id in ssts_need_remove.iter() {
                 snapshot.sstables.remove(old_sst_id);
             }
 
             for sst in compacted_ssts.iter() {
+                mini_lsm_debug!("sstable insert {}", sst.sst_id());
                 snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
             }
 
