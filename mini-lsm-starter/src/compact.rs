@@ -20,7 +20,7 @@ pub use simple_leveled::{
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::mini_lsm_debug;
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,7 +300,7 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        let _state_lock = self.state_lock.lock();
+        let state_lock = self.state_lock.lock();
 
         let compaction_task = {
             let guard = self.state.read();
@@ -312,7 +312,12 @@ impl LsmStorageInner {
         };
 
         let compacted_ssts = self.compact(&compaction_task)?;
-        let compacted_sst_ids = compacted_ssts.iter().map(|sst| sst.sst_id()).collect();
+        self.sync_dir()?;
+
+        let compacted_sst_ids = compacted_ssts
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect::<Vec<usize>>();
 
         // apply compact
         {
@@ -325,24 +330,30 @@ impl LsmStorageInner {
             snapshot.l0_sstables.clear();
 
             for old_sst_id in snapshot.levels[0].1.iter() {
-                mini_lsm_debug!("sstable remove {}", old_sst_id);
                 snapshot.sstables.remove(old_sst_id);
             }
-            snapshot.levels[0] = (1, compacted_sst_ids);
+            snapshot.levels[0] = (1, compacted_sst_ids.clone());
 
             for sst in compacted_ssts {
-                mini_lsm_debug!("sstable insert {}", sst.sst_id());
                 snapshot.sstables.insert(sst.sst_id(), sst);
             }
 
             *guard = Arc::new(snapshot);
         }
 
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record(
+                &state_lock,
+                ManifestRecord::Compaction(compaction_task, compacted_sst_ids),
+            )?;
+            self.sync_dir()?;
+        }
+
         Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        let _state_lock = self.state_lock.lock();
+        let state_lock = self.state_lock.lock();
 
         let snapshot = {
             let state = self.state.read();
@@ -358,6 +369,8 @@ impl LsmStorageInner {
         let compaction_task = compaction_task.unwrap();
 
         let compacted_ssts = self.compact(&compaction_task)?;
+        self.sync_dir()?;
+
         let compacted_sst_ids = compacted_ssts
             .iter()
             .map(|sst| sst.sst_id())
@@ -371,18 +384,23 @@ impl LsmStorageInner {
                 .compaction_controller
                 .apply_compaction_result(&snapshot, &compaction_task, &compacted_sst_ids);
 
-            mini_lsm_debug!("compact: {:?}", compacted_sst_ids);
-            mini_lsm_debug!("remove: {:?}", ssts_need_remove);
             for old_sst_id in ssts_need_remove.iter() {
                 snapshot.sstables.remove(old_sst_id);
             }
 
             for sst in compacted_ssts.iter() {
-                mini_lsm_debug!("sstable insert {}", sst.sst_id());
                 snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
             }
 
             *guard = Arc::new(snapshot);
+        }
+
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record(
+                &state_lock,
+                ManifestRecord::Compaction(compaction_task, compacted_sst_ids),
+            )?;
+            self.sync_dir()?;
         }
 
         Ok(())
