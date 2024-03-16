@@ -12,7 +12,12 @@ macro_rules! mini_lsm_debug {
         if $crate::debug::ENABLE_DEBUG {
             println!(concat!("\x1B[31m", $msg, "\x1B[0m"), $($arg)*)
         }
-    }
+    };
+    ($($arg:tt)*) => {{
+        if $crate::debug::ENABLE_DEBUG {
+            println!($($arg)*)
+        }
+    }};
 }
 
 impl LsmStorageInner {

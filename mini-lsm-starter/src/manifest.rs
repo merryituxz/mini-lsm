@@ -1,6 +1,4 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,12 +7,13 @@ use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::compact::CompactionTask;
+use crate::mini_lsm_debug;
 
 pub struct Manifest {
     file: Arc<Mutex<File>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum ManifestRecord {
     Flush(usize),
     NewMemtable(usize),
@@ -22,12 +21,41 @@ pub enum ManifestRecord {
 }
 
 impl Manifest {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(path)?;
+
+        Ok(Manifest {
+            file: Arc::new(Mutex::new(file)),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(path)?;
+
+        let mut stream = serde_json::Deserializer::from_reader(&file).into_iter::<ManifestRecord>();
+
+        let mut records = Vec::new();
+        while let Some(record) = stream.next() {
+            let record = record.unwrap();
+            records.push(record);
+        }
+
+        Ok((
+            Manifest {
+                file: Arc::new(Mutex::new(file)),
+            },
+            records,
+        ))
     }
 
     pub fn add_record(
@@ -38,7 +66,14 @@ impl Manifest {
         self.add_record_when_init(record)
     }
 
-    pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        let file = self.file.lock();
+
+        serde_json::to_writer(&(*file), &record)?;
+        mini_lsm_debug!("MANIFEST add record: {:?}", record);
+
+        file.sync_all()?;
+
+        Ok(())
     }
 }
