@@ -13,9 +13,9 @@ macro_rules! mini_lsm_debug {
             println!(concat!("\x1B[31m", $msg, "\x1B[0m"), $($arg)*)
         }
     };
-    ($($arg:tt)*) => {{
+    ($msg: expr) => {{
         if $crate::debug::ENABLE_DEBUG {
-            println!($($arg)*)
+            println!(concat!("\x1B[31m", $msg, "\x1B[0m"))
         }
     }};
 }
