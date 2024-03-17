@@ -70,7 +70,6 @@ impl Manifest {
         let file = self.file.lock();
 
         serde_json::to_writer(&(*file), &record)?;
-        mini_lsm_debug!("MANIFEST add record: {:?}", record);
 
         file.sync_all()?;
 
