@@ -169,18 +169,29 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.with_item(|(_, value)| value)
     }
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn key(&self) -> KeySlice<'_> {
+        self.with_item(|(key, _)| KeySlice::from_slice(key))
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.with_mut(|v| {
+            match v.iter.next() {
+                Some(entry) => {
+                    *v.item = (entry.key().clone(), entry.value().clone());
+                }
+                None => {
+                    // 清除当前项，表示迭代结束
+                    *v.item = (Bytes::new(), Bytes::new());
+                }
+            }
+        });
+        Ok(())
     }
 }
